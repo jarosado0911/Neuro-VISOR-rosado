@@ -24,11 +24,11 @@ public class ModelNMDA : ISynapseModel
     public ModelNMDA() {
         modelName = "NMDA";
         Erev = 0;                // (Volts) reversal potential for synapse, Stated explicitly in Rothman to usually be 0 Volts (page 7)
-        taud = 60.0e-3;           // (Seconds) decay constant from function, Stated explicitly in Rothman (figure 2)
-        g = 17e-9;               // (Siemens) 17 nano Siemens was chosen because it produces a noticeable post synaptic response across
-                                        // a single synapse, while still requiring multiple synapses to produce a post-synaptic action potential
-                                        // from a single pre-synaptic action potential  
-                                        // Each synapse has ~20 receptors of 50 pS each, each arrow is a cluster of 17 synapses
+        taud = 50.0e-3;           // (Seconds) decay constant, matches the paper (Table tab:hh_parameters) and
+                                        // NeuroVISOR-CSharpStudies/src/csharp/NmdaSynapse.cs (item 16; was 60ms)
+        g = 1e-9;                // (Siemens) matches the paper and the studies' validated value (item 16; was 17nS,
+                                        // deliberately oversized here for a more visible demo response - see getModelCurrent's
+                                        // comment below). A single synapse at 1nS gives only a sub-mV response (paper Sec. 2.7/2.8).
 
         v05 = -0.0128;           // (Volts) V0.5, first voltage constant used in Boltzmann function for Magnesium block, value found in figure 3 of Rothman
         k = 0.0224;              // (Volts) second voltage constant used in Boltzmann function, value found in figure 3 of Rothman

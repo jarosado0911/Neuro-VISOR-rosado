@@ -3,6 +3,7 @@ using System.Linq;
 using System;
 using UnityEngine;
 using Vector = MathNet.Numerics.LinearAlgebra.Vector<double>;
+using Matrix = MathNet.Numerics.LinearAlgebra.Matrix<double>;
 using CSparse.Storage;
 using CSparse.Double.Factorization;
 using CSparse;
@@ -68,14 +69,19 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// \f[\bar{g}_{K}n^4(V-V_k)\f]
         /// where \f$n\f$ is the state variable, and \f$V_k\f$ is the reversal potential.
         /// </summary>
-        private double gk = 6.0 * 1.0E1;
-        // private double gk = 36;
+        // 50, not 60: matches meshgenerator's IonChannelModels.cs and
+        // NeuroVISOR-CSharpStudies' SimParams.Gk (paper-validated) - rosado's
+        // old value of 60 produced a conduction speed persistently ~2.6% too
+        // fast vs. NEURON even at the finest timestep (not a temporal-order
+        // issue - a model-constant mismatch), found via the coarsening study.
+        private double gk = 5.0 * 1.0E1;
         /// <summary>
         /// [S/m2] sodium conductance per unit area, this is the Sodium conductance per unit area, it is used in this term
         /// \f[\bar{g}_{Na}m^3h(V-V_{Na})\f]
         /// where \f$m,h\f$ are the state variables, and \f$V_{Na}\f$ is the reversal potential for sodium.
         /// </summary>
-        private double gna = 56.0 * 1.0E1;
+        // 50, not 56: same fix as gk above (matches meshgenerator/SimParams.Gna).
+        private double gna = 50.0 * 1.0E1;
         
         /// <summary>
         /// [S/m2] leak conductance per unit area, this is the leak conductance per unit area, it is used in this term
@@ -98,21 +104,28 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// </summary>
         private double el = -70.0 * 1.0E-3;
         /// <summary>
-        /// [V] threshold voltage
+        /// [V] threshold shift V_T of the rate functions below, written in terms
+        /// of V - V_T. -55 mV matches the paper and NeuroVISOR-CSharpStudies'
+        /// SimParams.VTraub (meshgenerator's IonChannelModels.vTraubMv, same value).
         /// </summary>
-        private static double Vt = -50.0 * 1.0E-3;
+        private static double Vt = -55.0 * 1.0E-3;
         /// <summary>
-        /// [] potassium channel state probability, unitless
+        /// [] potassium channel state probability, unitless. Computed in
+        /// InitializeNeuronCell as alpha_n/(alpha_n+beta_n) at V = VStart, so the
+        /// cell always starts at its own true resting equilibrium instead of a
+        /// value baked in for the old (wrong) Vt.
         /// </summary>
-        private double ni = 0.0009648121738618698;
+        private double ni;
         /// <summary>
-        /// [] sodium channel state probability, unitless
+        /// [] sodium channel state probability, unitless. Computed in
+        /// InitializeNeuronCell as alpha_m/(alpha_m+beta_m) at V = VStart.
         /// </summary>
-        private double mi = 0.00016423459289788037;
+        private double mi;
         /// <summary>
-        /// [] sodium channel state probability, unitless  
+        /// [] sodium channel state probability, unitless. Computed in
+        /// InitializeNeuronCell as alpha_h/(alpha_h+beta_h) at V = VStart.
         /// </summary>
-        private double hi = 0.999975419740687;
+        private double hi;
         /// <summary>
         /// These are the solution vectors for the voltage <code>U</code>
         /// the state <c>M</c>, state <c>N</c>, and state <c>H</c>
@@ -159,6 +172,17 @@ namespace C2M2.NeuronalDynamics.Simulation
         CompressedColumnStorage<double> r_csc;              //This is for the rhs sparse matrix
         CompressedColumnStorage<double> l_csc;              //This is for the lhs sparse matrix
         private SparseLU SBDF_implicit_decomp;                                //Initialize the LU factorizaation
+        /// <summary>
+        /// SBDF2 needs two past voltage/gating levels, but at t=0 only V^0
+        /// exists; starting it with V^(-1)=V^0 instead makes the whole run
+        /// first order in time (paper Sec. 3.1.2). This is the factorization of
+        /// I - timeStep*A used only for SolveStep's t==0 IMEX-Euler start-up
+        /// step - makeSparseStencils already scales its matrix by (2/3)*its dt
+        /// argument, so building it with 1.5*timeStep (in PreSolve) gives
+        /// exactly I - timeStep*A, matching NeuroVISOR-CSharpStudies'
+        /// Sbdf2Solver.cs FactorStartup/SolveStartup.
+        /// </summary>
+        private SparseLU luStartup;
 
         /// <summary>
         /// Send simulation 1D values, this send the current voltage after the solve runs 1 iteration
@@ -194,19 +218,39 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// <param name="newValues"></param>
         public override void Set1DValues((int, double)[] newValues)
         {
+            // De-duplicate by vertex (last entry wins, matching the old per-call-overwrite
+            // behavior if the same vertex appears twice in one batch), while preserving
+            // insertion order so a later duplicate still wins predictably.
+            var valid = new Dictionary<int, double>();
             foreach ((int, double) newVal in newValues)
             {
                 if (newVal.Item1 >= 0 && newVal.Item1 < Neuron.nodes.Count)
                 {
-                    // perform a rank1 update solve to properly update with added dirichelet boundary conditions
-                    // from a raycast, or voltage clamp. This is done because with a voltage clamp you are imposing
-                    // a dirichelet B.C. which requires solving an updated diffusion problem with identity rows.
-                    Vector result = DircheletRank1UpdateSolve(newVal);
-                    lock (visualizationValuesLock)
-                    {
-                        U_Active = Vector.Build.DenseOfVector(result);
-                    }
+                    valid[newVal.Item1] = newVal.Item2;
                 }
+            }
+            if (valid.Count == 0) return;
+
+            Vector result;
+            if (valid.Count == 1)
+            {
+                // single Dirichlet row: the plain Sherman-Morrison rank-1 solve is already
+                // exact on its own, no need for the more general rank-r machinery below.
+                var only = valid.First();
+                result = DircheletRank1UpdateSolve((only.Key, only.Value));
+            }
+            else
+            {
+                // r >= 2 simultaneous Dirichlet rows (multiple clamps, multiple direct-
+                // stimulation hits, or both together): solve them all AT ONCE via the
+                // Sherman-Morrison-Woodbury rank-r update (paper Sec. 6.3, eqn:woodbury),
+                // so every one of them is exact - not just the last one applied (item 18).
+                result = DircheletRankRUpdateSolve(valid);
+            }
+
+            lock (visualizationValuesLock)
+            {
+                U_Active = Vector.Build.DenseOfVector(result);
             }
         }
 
@@ -241,6 +285,69 @@ namespace C2M2.NeuronalDynamics.Simulation
 
             return YY.Add(ZZ.Multiply(rj.DotProduct(YY) / (1 - rj.DotProduct(ZZ))));
         }
+
+        /// <summary>
+        /// Rank-r generalization of <see cref="DircheletRank1UpdateSolve"/>: imposes Dirichlet
+        /// boundary conditions at r &gt;= 2 distinct vertices SIMULTANEOUSLY and exactly, via the
+        /// Sherman-Morrison-Woodbury formula (paper Sec. 6.3, eqn:woodbury) - fixes item 18
+        /// ("more than one simultaneous clamp is not imposed correctly"): calling the rank-1
+        /// solve once per vertex only leaves the LAST one exact, because each call re-derives
+        /// its correction from the original (unclamped) matrix M, so any earlier row
+        /// replacement is forgotten.
+        ///
+        /// Letting M' be M with rows k_1..k_r each replaced by an identity row e_{k_i}^T:
+        ///   M' = M - E C^T,  E = [e_{k_1} .. e_{k_r}],  C[:,i] = (row k_i of M)^T - e_{k_i}
+        /// Woodbury:
+        ///   x = M'^{-1} R = y + Z (I_r - C^T Z)^{-1} C^T y,  where Z = M^{-1} E,  y = M^{-1} R
+        /// which needs r+1 solves against the existing LU factorization of M (one per clamped
+        /// vertex's unit column, plus one for R), plus one small r x r dense solve - no
+        /// refactorization of M itself.
+        /// </summary>
+        /// <param name="newVals">vertex -> target Dirichlet voltage, r >= 2 distinct vertices</param>
+        public Vector DircheletRankRUpdateSolve(IReadOnlyDictionary<int, double> newVals)
+        {
+            int n = Neuron.nodes.Count;
+            int r = newVals.Count;
+            int[] idx = newVals.Keys.ToArray();
+
+            // R is the shared reaction RHS vector; stamp every clamped vertex's target
+            // voltage into it, same role as the single-clamp case's R.At(j, v).
+            foreach (var kv in newVals) R.At(kv.Key, kv.Value);
+
+            // C[:, i] = (row idx[i] of M)^T - e_{idx[i]}, and Z[:, i] = M^{-1} e_{idx[i]} -
+            // the same "rj"/"z" vectors DircheletRank1UpdateSolve computes for a single
+            // vertex, just one column per clamped vertex here.
+            Matrix C = Matrix.Build.Dense(n, r);
+            Matrix Z = Matrix.Build.Dense(n, r);
+            double[] ejArr = new double[n];
+            double[] rowI = new double[n];
+            double[] zi = new double[n];
+            for (int i = 0; i < r; i++)
+            {
+                System.Array.Clear(ejArr, 0, n);
+                ejArr[idx[i]] = 1.0;
+
+                (l_csc.Transpose()).Multiply(ejArr, rowI);
+                rowI[idx[i]] -= 1.0;
+                C.SetColumn(i, rowI);
+
+                SBDF_implicit_decomp.Solve(ejArr, zi);
+                Z.SetColumn(i, zi);
+            }
+
+            double[] yArr = new double[n];
+            SBDF_implicit_decomp.Solve(R.ToArray(), yArr);
+            Vector y = Vector.Build.DenseOfArray(yArr);
+
+            // S = I_r - C^T Z  (r x r, dense);  rhs = C^T y  (r-vector)
+            Matrix S = Matrix.Build.DenseIdentity(r) - C.TransposeThisAndMultiply(Z);
+            Vector rhs = C.TransposeThisAndMultiply(y);
+            Vector alpha = S.Solve(rhs);
+
+            // x = y + Z*alpha
+            return y.Add(Z.Multiply(alpha));
+        }
+
         /// <summary>
         /// Receives 1D information for synaptic communication
         /// newValues = is a list of (presynapse, postsynapse)
@@ -261,8 +368,10 @@ namespace C2M2.NeuronalDynamics.Simulation
                     Isyn[1][newVal.Item2.FocusVert] += tmp[1];
                     // we have the neuron ID, the vertex ID on that neuron, and the current coming from that vertex
                     newVal.Item2.currentIsyn = new List<double> {newVal.Item1.simulation.simID, newVal.Item1.FocusVert, tmp[0]};
-                    // compute surface area at postsynaptic location and scale for timestepping use
-                    surfaceArea[newVal.Item2.FocusVert] = 1 / (cap * 2 * System.Math.PI * Neuron.nodes[newVal.Item2.FocusVert].NodeRadius * Neuron.TargetEdgeLength * 1e-12);
+                    // Surface area at the postsynaptic location, using the same control-volume
+                    // membrane length the matrix itself uses at that node (item 14) instead of
+                    // the global target edge length.
+                    surfaceArea[newVal.Item2.FocusVert] = 1 / (cap * 2 * System.Math.PI * Neuron.nodes[newVal.Item2.FocusVert].NodeRadius * MembraneLengthMicrons(newVal.Item2.FocusVert) * 1e-12);
                 }  
             }
         }
@@ -290,21 +399,60 @@ namespace C2M2.NeuronalDynamics.Simulation
             // Since getUpre() isn't a virtual method declared in the abstract class NDSimulation.cs, the solver obtained
             // from the presynaptic neuron must be cast as a SparseSolverTestv1 class
 
-            // get the pre-synaptic voltage at current and previous timeStep
+            // Presynaptic voltage: used ONLY to detect the upward threshold crossing that sets
+            // ActivationTime below - never fed into the current formula itself (item 9).
             double presynVoltage = newVal.Item1.simulation.Get1DValues()[newVal.Item1.FocusVert];
             double presynVoltagePrev = ((SparseSolverTestv1)newVal.Item1.simulation).getUpre()[newVal.Item1.FocusVert];
 
-            if (model.isActive(presynVoltage, presynVoltagePrev, GetSimulationTime(), newVal.Item1.ActivationTime))
+            // Postsynaptic voltage: b(V)*(V-E) is evaluated at the synapse's OWN (postsynaptic)
+            // node, per the paper and NeuroVISOR-CSharpStudies' NmdaSynapse.cs/GabaSynapse.cs
+            // (item 9 - this was the presynaptic voltage before).
+            double postsynVoltage = newVal.Item2.simulation.Get1DValues()[newVal.Item2.FocusVert];
+            double postsynVoltagePrev = ((SparseSolverTestv1)newVal.Item2.simulation).getUpre()[newVal.Item2.FocusVert];
+
+            // [V] Spike-detection threshold (paper Sec. 3.1.5) - re-checked against the
+            // -70 mV/-55 mV frame (items 1-2): still comfortably inside this model's spike peak (item 13).
+            const double voltageThreshold = 0.038;
+
+            // One activation per upward threshold crossing (item 12) - a later crossing
+            // re-activates. No longer reset every 0.3 ms, and no longer tied to the
+            // presynaptic voltage falling back below threshold.
+            if ((presynVoltage >= voltageThreshold) && (presynVoltagePrev < voltageThreshold))
             {
                 newVal.Item1.ActivationTime = GetSimulationTime();
             }
 
-            //Adds the synaptic currents for the current and previous timesteps
-            Icurrs.Add(model.getModelCurrent(presynVoltage, GetSimulationTime(), newVal.Item1.ActivationTime));
-            Icurrs.Add(model.getModelCurrent(presynVoltagePrev, GetSimulationTime() - timeStep, newVal.Item1.ActivationTime));
+            double tCur = GetSimulationTime();
+            double tPrev = tCur - timeStep;
+            double ts = newVal.Item1.ActivationTime;
 
+            //Adds the synaptic currents for the current and previous timesteps
+            Icurrs.Add(model.getModelCurrent(postsynVoltage, tCur, ts));
+            Icurrs.Add(model.getModelCurrent(postsynVoltagePrev, tPrev, ts));
+
+            // Only guard against a genuine computational error (NaN/Infinity), not a
+            // legitimately large current (item 15).
+            if (Double.IsNaN(Icurrs[0]) || Double.IsNaN(Icurrs[1]) || Double.IsInfinity(Icurrs[0]) || Double.IsInfinity(Icurrs[1]))
+            {
+                Icurrs[0] = 0.0; Icurrs[1] = 0.0;
+            }
 
             return Icurrs;
+        }
+
+        /// <summary>
+        /// Control-volume membrane length at a node: half the sum of its incident
+        /// edge lengths, in the same (unscaled) units as Neuron.TargetEdgeLength -
+        /// matches makeSparseStencils' avgEdgeLengths (item 6/14).
+        /// </summary>
+        private double MembraneLengthMicrons(int nodeIndex)
+        {
+            double sum = 0.0;
+            foreach (var kv in Neuron.nodes[nodeIndex].AdjacencyList)
+            {
+                sum += kv.Value;
+            }
+            return 0.5 * sum;
         }
 
         /// <summary>
@@ -339,6 +487,12 @@ namespace C2M2.NeuronalDynamics.Simulation
             b = new double[Neuron.nodes.Count];
             ///<c>var lu = SparseLU.Create(l_csc, ColumnOrdering.MinimumDegreeAtA, 0.1);</c> this creates the LU decomposition of the HINES matrix which is defined by <c>l_csc</c>
             SBDF_implicit_decomp = SparseLU.Create(l_csc, ColumnOrdering.MinimumDegreeAtA, 0.1);
+
+            /// IMEX-Euler start-up factorization I - timeStep*A for SolveStep's
+            /// t==0 branch - see luStartup's doc comment.
+            var startupStencils = makeSparseStencils(Neuron, res, cap, 1.5 * timeStep);
+            var startupLcsc = CompressedColumnStorage<double>.OfIndexed(startupStencils[1]);
+            luStartup = SparseLU.Create(startupLcsc, ColumnOrdering.MinimumDegreeAtA, 0.1);
         }
 
         /// <summary>
@@ -348,6 +502,46 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// </summary>     
         protected override void SolveStep(int t)
         {
+            if (t == 0)
+            {
+                // IMEX-Euler (SBDF1) start-up step - see luStartup's doc comment.
+                // Forward Euler for the gating variables and voltage:
+                // (I - timeStep*A) V^1 = V^0 + timeStep*(reaction + synaptic),
+                // solved against luStartup instead of the regular SBDF2 matrix,
+                // since SBDF2 needs a V^(-1) that does not exist yet at t=0.
+                R = U_Active.Clone();
+                R.Add(reactF(reactConst, U_Active, N, M, H, cap).Multiply(timeStep), R);
+                // Subtracted: Isyn is an outward-positive current, same convention reactF
+                // uses for the Na/K/leak currents (item 10) - an outward current should
+                // DECREASE voltage, not increase it.
+                R.Subtract(Isyn[0].PointwiseMultiply(surfaceArea).Multiply(timeStep), R);
+                Isyn[0].Multiply(0.0, Isyn[0]);
+                Isyn[1].Multiply(0.0, Isyn[1]);
+                surfaceArea.Multiply(0.0, surfaceArea);
+
+                luStartup.Solve(R.ToArray(), b);
+
+                tempState = N.Clone();
+                N.Add(fS(N, an(U_Active), bn(U_Active), timeStep).Multiply(timeStep), N);
+                Npre = tempState.Clone();
+
+                tempState = M.Clone();
+                M.Add(fS(M, am(U_Active), bm(U_Active), timeStep).Multiply(timeStep), M);
+                Mpre = tempState.Clone();
+
+                tempState = H.Clone();
+                H.Add(fS(H, ah(U_Active), bh(U_Active), timeStep).Multiply(timeStep), H);
+                Hpre = tempState.Clone();
+
+                N.Map(x => System.Math.Max(0.0, System.Math.Min(1.0, x)), N);
+                M.Map(x => System.Math.Max(0.0, System.Math.Min(1.0, x)), M);
+                H.Map(x => System.Math.Max(0.0, System.Math.Min(1.0, x)), H);
+
+                Upre = U_Active.Clone();
+                U_Active.SetSubVector(0, Neuron.nodes.Count, Vector.Build.DenseOfArray(b));
+                return;
+            }
+
             R = U_Active.Clone();
             explicitUpdate(R, Upre, reactF(reactConst, U_Active, N, M, H, cap), reactF(reactConst, Upre, Npre, Mpre, Hpre, cap), timeStep, 1);
 
@@ -358,7 +552,10 @@ namespace C2M2.NeuronalDynamics.Simulation
             Isyn[0].Multiply(0.0, Isyn[0]);
             Isyn[1].Multiply(0.0, Isyn[1]);
             surfaceArea.Multiply(0.0, surfaceArea);
-            R.Add(Rsyn, R);
+            // Subtracted: Isyn/Rsyn is an outward-positive current, same convention
+            // reactF uses for the Na/K/leak currents (item 10) - an outward current
+            // should DECREASE voltage, not increase it.
+            R.Subtract(Rsyn, R);
             SBDF_implicit_decomp.Solve(R.ToArray(), b);
 
             tempState = N.Clone();
@@ -424,8 +621,12 @@ namespace C2M2.NeuronalDynamics.Simulation
             /// the dtmin is based on prior numerical experiments that revealed that for each refinement level the 
             /// voltage profiles were visually accurate when compared to Yale Neuron for delta t at least 2 microseconds
             /// we want to avoid using dtmin; therefore I compute the upper bound (and lower bound for reference)
-            //double dtmin = 2e-6;  
-            double dtmax = 50e-6;
+            //double dtmin = 2e-6;
+            // Paper Sec. 2.6.1: SBDF2 diverges on the test cell at dt >= 50us;
+            // dt <= 32us is recommended. This is the only place dt is actually
+            // decided (this function's result unconditionally overwrites whatever
+            // the loader otherwise defaulted to), so 32us is set here, once.
+            double dtmax = 32e-6;
             double dt;
 
             double gll = gl; double scf = 1E-6; // to convert to micrometer of edgelengths and radii don't forget this!!!!
@@ -454,12 +655,25 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// </summary>
         private void InitializeNeuronCell()
         {
+            const double VStart = -70.0 * 1.0E-3;
+
             lock (visualizationValuesLock)
             {
-                U = Vector.Build.Dense(Neuron.nodes.Count, -70.0 * 1.0E-3);
+                U = Vector.Build.Dense(Neuron.nodes.Count, VStart);
                 U_Active = U.Clone();
             }
             Upre = U_Active.Clone();
+
+            // Gating variables start at their steady-state probability at VStart
+            // (alpha/(alpha+beta)), so the cell starts at its own true resting
+            // equilibrium instead of a value hardcoded for a different V_T.
+            Vector vStartVec = Vector.Build.Dense(1, VStart);
+            double an0 = an(vStartVec)[0], bn0 = bn(vStartVec)[0];
+            double am0 = am(vStartVec)[0], bm0 = bm(vStartVec)[0];
+            double ah0 = ah(vStartVec)[0], bh0 = bh(vStartVec)[0];
+            ni = an0 / (an0 + bn0);
+            mi = am0 / (am0 + bm0);
+            hi = ah0 / (ah0 + bh0);
 
             M = Vector.Build.Dense(Neuron.nodes.Count, mi);
             N = Vector.Build.Dense(Neuron.nodes.Count, ni);
@@ -542,8 +756,13 @@ namespace C2M2.NeuronalDynamics.Simulation
                     edgelengths.Add(tempEdgeLen);
                     sumRecip = sumRecip + 1 / (tempEdgeLen * tempRadius * ((1 / (myCell.nodes[nghbrIds].NodeRadius*scf* myCell.nodes[nghbrIds].NodeRadius*scf)) + (1 / (tempRadius * tempRadius))));
                 }
-                /// get the average edge lengths of neighbors \n
-                avgEdgeLengths = edgelengths.Average();
+                /// control-volume length at node j: half the sum of its incident
+                /// edge lengths (paper Sec. 3.1.1; matches
+                /// NeuroVISOR-CSharpStudies/src/csharp/Sbdf2Solver.cs's
+                /// HalfEdgeMembraneLength). The plain average instead gave end
+                /// nodes a full edge and branch nodes sum/3, making the spatial
+                /// discretization only first order.
+                avgEdgeLengths = 0.5 * edgelengths.Sum();
                 /// set main diagonal entries using <c>rhs.At()</c>
                 /// this is BE method, no oscillations but not as accurate!
                 rhs.At(j, j, 1.0);
