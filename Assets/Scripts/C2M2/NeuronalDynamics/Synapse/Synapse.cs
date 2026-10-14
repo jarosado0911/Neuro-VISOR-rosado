@@ -26,7 +26,55 @@ public class Synapse : NDInteractables
     private bool isBeingDestroyed = false;
 
 
-    public double ActivationTime { get; set; }
+    // Activation time t_s of this (presynaptic) synapse. It is written by the solve thread
+    // of the presynaptic cell, which detects the threshold crossing, and read by the solve
+    // thread of the postsynaptic cell, which can be another thread up to one step ahead or
+    // behind (the solve barrier keeps all cells within one step of each other).
+    private object activationLock = new object();
+    private double activationTime = double.NegativeInfinity;
+    private double previousActivationTime = double.NegativeInfinity;
+    private int activationStep = int.MinValue;
+
+    /// <summary>
+    /// The latest activation time [s]. Setting it (placement, loading) makes it visible to
+    /// every time step at once.
+    /// </summary>
+    public double ActivationTime
+    {
+        get { lock (activationLock) return activationTime; }
+        set
+        {
+            lock (activationLock)
+            {
+                activationTime = value;
+                previousActivationTime = value;
+                activationStep = int.MinValue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records an activation detected at time level <paramref name="step"/>, t_s = t_step.
+    /// </summary>
+    public void RecordActivation(double ts, int step)
+    {
+        lock (activationLock)
+        {
+            previousActivationTime = activationTime;
+            activationTime = ts;
+            activationStep = step;
+        }
+    }
+
+    /// <summary>
+    /// The activation time to use for the synaptic current at time level <paramref name="step"/>.
+    /// An activation detected at a later level (by a presynaptic cell whose thread is already one
+    /// step ahead) is not visible yet, so the current does not depend on thread timing.
+    /// </summary>
+    public double ActivationTimeAt(int step)
+    {
+        lock (activationLock) return activationStep <= step ? activationTime : previousActivationTime;
+    }
 
     public List<double> currentIsyn = new List<double>();
 
@@ -78,6 +126,8 @@ public class Synapse : NDInteractables
         other.Id = Interlocked.Increment(ref nextId);
         // Re-resolve currentModel to avoid sharing the LinkedListNode reference
         other.currentModel = modelList.Find(currentModel.Value);
+        // and give the clone its own activation lock
+        other.activationLock = new object();
         return other;
     }
     public override void Place(int index)

@@ -9,4 +9,5 @@ public interface ISynapseModel
     bool isActive(double presynVoltage, double presynVoltagePrev, double SimulationTime, double ActivationTime);
     double getImax();
     double getTaud();
+    double getConductance();
 }

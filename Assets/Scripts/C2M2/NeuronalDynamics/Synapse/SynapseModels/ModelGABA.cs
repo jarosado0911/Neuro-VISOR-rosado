@@ -18,7 +18,7 @@ public class ModelGABA : ISynapseModel
     private double Imax;
     private double voltageThreshold;   //Volts
     private double refireRate; // refire at 5%
-    private double minRefireTime; // ms
+    private double minRefireTime; // s
     public ModelGABA() {
         modelName = "GABA";
         Erev = -0.080;           // (Volts) GABA_A reversal potential - matches the paper and
@@ -33,7 +33,7 @@ public class ModelGABA : ISynapseModel
 
         voltageThreshold = 0.038;   //Volts
         refireRate = 3.0; // refire at 5%
-        minRefireTime = 1.0e-2; // ms
+        minRefireTime = 1.0e-2; // s
     }
 
     /// This is the GABA Synapse function borrowed from Rothman.
@@ -44,6 +44,8 @@ public class ModelGABA : ISynapseModel
     /// <returns></returns>
     public double getModelCurrent(double v, double t, double ts)
     {
+        // a(t) = 0 before the activation time ts (paper Sec. 3.1.5)
+        if (t < ts - 1.0e-12) return 0.0;
         double current = g * System.Math.Exp(-(t - ts) / taud) * (v - Erev);
         
         return current;      
@@ -62,6 +64,11 @@ public class ModelGABA : ISynapseModel
     public double getTaud()
     {
         return taud;
+    }
+
+    public double getConductance()
+    {
+        return g;
     }
     
     //Boolean for synapse behavior, used for material of synapse

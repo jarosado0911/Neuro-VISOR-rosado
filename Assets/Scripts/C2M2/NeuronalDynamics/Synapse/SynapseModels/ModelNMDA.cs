@@ -20,15 +20,14 @@ public class ModelNMDA : ISynapseModel
     private double Imax; 
     private double voltageThreshold;   //Volts
     private double refireRate; // refire at 5%
-    private double minRefireTime; // ms
+    private double minRefireTime; // s
     public ModelNMDA() {
         modelName = "NMDA";
         Erev = 0;                // (Volts) reversal potential for synapse, Stated explicitly in Rothman to usually be 0 Volts (page 7)
         taud = 50.0e-3;           // (Seconds) decay constant, matches the paper (Table tab:hh_parameters) and
                                         // NeuroVISOR-CSharpStudies/src/csharp/NmdaSynapse.cs (item 16; was 60ms)
         g = 1e-9;                // (Siemens) matches the paper and the studies' validated value (item 16; was 17nS,
-                                        // deliberately oversized here for a more visible demo response - see getModelCurrent's
-                                        // comment below). A single synapse at 1nS gives only a sub-mV response (paper Sec. 2.7/2.8).
+                                        // deliberately oversized here for a more visible demo response). A single synapse at 1nS gives only a sub-mV response (paper Sec. 2.7/2.8).
 
         v05 = -0.0128;           // (Volts) V0.5, first voltage constant used in Boltzmann function for Magnesium block, value found in figure 3 of Rothman
         k = 0.0224;              // (Volts) second voltage constant used in Boltzmann function, value found in figure 3 of Rothman
@@ -38,7 +37,7 @@ public class ModelNMDA : ISynapseModel
         
         voltageThreshold = 0.038;   //Volts
         refireRate = 3.0; // refire at 5%
-        minRefireTime = 1.0e-2; // ms
+        minRefireTime = 1.0e-2; // s
     }
 
     //Returns the Synaptic Current. Used in SparseSolver.
@@ -60,13 +59,13 @@ public class ModelNMDA : ISynapseModel
         The following values were pulled directly from figure 3:
         v05=-0.0128, k=0.0224
 
-        The following values were pulled directly from figure 2:
-        taud=3.0e-4
-
         EnmdaR is "usually 0 mv" (page 7)
 
-        Although the value for g used by the Rothman is 1e-9, an arbitrary value has been chosen that demonstrates synaptic behavior well
+        taud and g are the values of the paper (Table tab:hh_parameters): 50 ms and 1 nS
+
+        a(t) = 0 before the activation time ts (paper Sec. 3.1.5)
         */
+        if (t < ts - 1.0e-12) return 0.0;
 
         double current = g * (1.0 / (1.0 + System.Math.Exp(-(v-v05) / k))) * System.Math.Exp(-(t - ts) / taud) * (v - Erev);
 
@@ -87,6 +86,11 @@ public class ModelNMDA : ISynapseModel
     public double getTaud()
     {
         return taud;
+    }
+
+    public double getConductance()
+    {
+        return g;
     }
     
 

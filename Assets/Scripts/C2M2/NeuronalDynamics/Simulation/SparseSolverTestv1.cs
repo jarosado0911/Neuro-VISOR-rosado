@@ -183,6 +183,17 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// Sbdf2Solver.cs FactorStartup/SolveStartup.
         /// </summary>
         private SparseLU luStartup;
+        /// <summary>
+        /// The matrix I - timeStep*A that <see cref="luStartup"/> factors; its rows are needed by
+        /// the Dirichlet updates after the start-up step.
+        /// </summary>
+        private CompressedColumnStorage<double> startupLcsc;
+        /// <summary>
+        /// True between the start-up step (t == 0) and the next step: the Dirichlet updates in
+        /// PostSolveStep(0) must modify the system that step solved, I - timeStep*A with the
+        /// IMEX-Euler right-hand side, not the SBDF2 one.
+        /// </summary>
+        private bool startupStepSolved = false;
 
         /// <summary>
         /// Send simulation 1D values, this send the current voltage after the solve runs 1 iteration
@@ -270,15 +281,19 @@ namespace C2M2.NeuronalDynamics.Simulation
             Vector ZZ = ej.Clone();
             Vector YY = ej.Clone();
 
+            // the system the last step solved: the start-up one after t == 0, else SBDF2
+            SparseLU decomp = startupStepSolved ? luStartup : SBDF_implicit_decomp;
+            CompressedColumnStorage<double> lhs = startupStepSolved ? startupLcsc : l_csc;
+
             R.At(newVal.Item1, newVal.Item2);
             ej = Vector.Build.Dense(Neuron.nodes.Count, 0.0);
             ej.At(newVal.Item1, 1.0);
-            (l_csc.Transpose()).Multiply(ej.ToArray(), bj);
+            (lhs.Transpose()).Multiply(ej.ToArray(), bj);
             rj = Vector.Build.DenseOfArray(bj);
             rj.At(newVal.Item1, rj[newVal.Item1] - 1);
 
-            SBDF_implicit_decomp.Solve(ej.ToArray(), z);
-            SBDF_implicit_decomp.Solve(R.ToArray(), y);
+            decomp.Solve(ej.ToArray(), z);
+            decomp.Solve(R.ToArray(), y);
             
             ZZ = Vector.Build.DenseOfArray(z);
             YY = Vector.Build.DenseOfArray(y);
@@ -310,6 +325,10 @@ namespace C2M2.NeuronalDynamics.Simulation
             int r = newVals.Count;
             int[] idx = newVals.Keys.ToArray();
 
+            // the system the last step solved: the start-up one after t == 0, else SBDF2
+            SparseLU decomp = startupStepSolved ? luStartup : SBDF_implicit_decomp;
+            CompressedColumnStorage<double> lhs = startupStepSolved ? startupLcsc : l_csc;
+
             // R is the shared reaction RHS vector; stamp every clamped vertex's target
             // voltage into it, same role as the single-clamp case's R.At(j, v).
             foreach (var kv in newVals) R.At(kv.Key, kv.Value);
@@ -327,16 +346,16 @@ namespace C2M2.NeuronalDynamics.Simulation
                 System.Array.Clear(ejArr, 0, n);
                 ejArr[idx[i]] = 1.0;
 
-                (l_csc.Transpose()).Multiply(ejArr, rowI);
+                (lhs.Transpose()).Multiply(ejArr, rowI);
                 rowI[idx[i]] -= 1.0;
                 C.SetColumn(i, rowI);
 
-                SBDF_implicit_decomp.Solve(ejArr, zi);
+                decomp.Solve(ejArr, zi);
                 Z.SetColumn(i, zi);
             }
 
             double[] yArr = new double[n];
-            SBDF_implicit_decomp.Solve(R.ToArray(), yArr);
+            decomp.Solve(R.ToArray(), yArr);
             Vector y = Vector.Build.DenseOfArray(yArr);
 
             // S = I_r - C^T Z  (r x r, dense);  rhs = C^T y  (r-vector)
@@ -362,73 +381,110 @@ namespace C2M2.NeuronalDynamics.Simulation
             {
                 if ((newVal.Item1 != null) && (newVal.Item2 != null))
                 {
+                    // Membrane area [um^2] at the postsynaptic location, using the same control-volume
+                    // membrane length the matrix itself uses at that node (item 14) instead of
+                    // the global target edge length.
+                    double areaMicrons2 = 2 * System.Math.PI * Neuron.nodes[newVal.Item2.FocusVert].NodeRadius * MembraneLengthMicrons(newVal.Item2.FocusVert);
+
                     //tmp[0] is current synaptic state, and tmp[1] is previous synaptic state
-                    tmp = SynapseCurrentFunction(newVal, newVal.Item1.currentModel.Value);
+                    tmp = SynapseCurrentFunction(newVal, newVal.Item1.currentModel.Value, areaMicrons2);
                     Isyn[0][newVal.Item2.FocusVert] += tmp[0];
                     Isyn[1][newVal.Item2.FocusVert] += tmp[1];
                     // we have the neuron ID, the vertex ID on that neuron, and the current coming from that vertex
                     newVal.Item2.currentIsyn = new List<double> {newVal.Item1.simulation.simID, newVal.Item1.FocusVert, tmp[0]};
-                    // Surface area at the postsynaptic location, using the same control-volume
-                    // membrane length the matrix itself uses at that node (item 14) instead of
-                    // the global target edge length.
-                    surfaceArea[newVal.Item2.FocusVert] = 1 / (cap * 2 * System.Math.PI * Neuron.nodes[newVal.Item2.FocusVert].NodeRadius * MembraneLengthMicrons(newVal.Item2.FocusVert) * 1e-12);
-                }  
+                    surfaceArea[newVal.Item2.FocusVert] = 1 / (cap * areaMicrons2 * 1e-12);
+                }
+            }
+        }
+
+        /// <summary>
+        /// [V] Spike-detection threshold (paper Sec. 3.1.5) - re-checked against the
+        /// -70 mV/-55 mV frame (items 1-2): still comfortably inside this model's spike peak (item 13).
+        /// </summary>
+        private const double spikeThreshold = 0.038;
+
+        /// <summary>
+        /// [nS/um^2] Largest synaptic conductance per membrane area of the synapse's node for which the
+        /// explicit synaptic term stays stable at dt = 32 us (paper Sec. 2.8, Table tab:gaba_stability:
+        /// 8 nS on the 0.205 um^2 distal endpoint is the largest stable value, 11.3 nS is unstable).
+        /// The bound grows like dt^(-1/2).
+        /// </summary>
+        private const double maxConductancePerArea32us = 39.0;
+        /// <summary>
+        /// Post synapses whose conductance has already been reported as capped.
+        /// </summary>
+        private readonly HashSet<Synapse> cappedSynapses = new HashSet<Synapse>();
+
+        /// <summary>
+        /// Upward crossings of the spike-detection threshold at the presynaptic nodes on this cell
+        /// between V^t (Upre) and V^(t+1) (U_Active). The activation time is the first time level
+        /// at or above the threshold, t_s = t_(t+1) (paper Sec. 3.1.5). One activation per
+        /// crossing (item 12); a later crossing re-activates.
+        /// </summary>
+        internal override void DetectSynapseActivations(List<Synapse> preSynapses, int t)
+        {
+            int level = t + 1;
+            foreach (Synapse pre in preSynapses)
+            {
+                int k = pre.FocusVert;
+                if (k < 0 || k >= Neuron.nodes.Count) continue;
+                if ((U_Active[k] >= spikeThreshold) && (Upre[k] < spikeThreshold))
+                {
+                    pre.RecordActivation(level * timeStep, level);
+                }
             }
         }
 
         /// <summary>
         /// This is the synaptic current function
-        /// the input is a tuple (presyn, postsyn) = (item1, item2) respectively
-        /// each synapse contains information
-        /// item1.nodeindex = index on the 1d geometry
-        /// item1.voltage = voltage at that node
+        /// the input is a tuple (presyn, postsyn) = (item1, item2) respectively, and the membrane
+        /// area of the postsynaptic node in um^2.
+        /// Called from PreSolveStep(t), before the step from V^t to V^(t+1): returns the synaptic
+        /// current at level t (V^t, t_t) and at level t-1 (V^(t-1), t_(t-1)), the B^i and B^(i-1)
+        /// of the SBDF2 step.
         /// </summary>
         /// <param name="newVal"></param>
         /// <returns></returns>
-        public List<double> SynapseCurrentFunction((Synapse, Synapse) newVal, ISynapseModel model)
+        public List<double> SynapseCurrentFunction((Synapse, Synapse) newVal, ISynapseModel model, double areaMicrons2)
         {
             //List contains the current synaptic current at index 0 and previous synaptic current at index 1
             List<double> Icurrs = new List<double>();
 
-            // Explanation of local variables:
-            // newVal is the (Synapse, Synapse) pair that refers to the superstructure of synapse
-            // Item1 refers to the presynaptic node, Item2 refers to the postsynaptic node
-            // Calling Item1.simulation grabs the SparseSolver attached to the neuron containing the presynaptic node
-            // From here, we either use .Get1DValues() for current timestep Vm array, or getUpre for previous timestep Vm array
-            // newVal.Item1.FocusVert refers to the index of the node on the neuron which the pre- or postsynapse is placed
-            // Since getUpre() isn't a virtual method declared in the abstract class NDSimulation.cs, the solver obtained
-            // from the presynaptic neuron must be cast as a SparseSolverTestv1 class
-
-            // Presynaptic voltage: used ONLY to detect the upward threshold crossing that sets
-            // ActivationTime below - never fed into the current formula itself (item 9).
-            double presynVoltage = newVal.Item1.simulation.Get1DValues()[newVal.Item1.FocusVert];
-            double presynVoltagePrev = ((SparseSolverTestv1)newVal.Item1.simulation).getUpre()[newVal.Item1.FocusVert];
-
             // Postsynaptic voltage: b(V)*(V-E) is evaluated at the synapse's OWN (postsynaptic)
             // node, per the paper and NeuroVISOR-CSharpStudies' NmdaSynapse.cs/GabaSynapse.cs
-            // (item 9 - this was the presynaptic voltage before).
-            double postsynVoltage = newVal.Item2.simulation.Get1DValues()[newVal.Item2.FocusVert];
-            double postsynVoltagePrev = ((SparseSolverTestv1)newVal.Item2.simulation).getUpre()[newVal.Item2.FocusVert];
+            // (item 9). The postsynaptic node is on this cell, so V^t and V^(t-1) are this
+            // solver's own U_Active and Upre - not the visualization copy, which still holds the
+            // previous step until SetOutputValues (item 17).
+            int k = newVal.Item2.FocusVert;
+            double postsynVoltage = U_Active[k];
+            double postsynVoltagePrev = Upre[k];
 
-            // [V] Spike-detection threshold (paper Sec. 3.1.5) - re-checked against the
-            // -70 mV/-55 mV frame (items 1-2): still comfortably inside this model's spike peak (item 13).
-            const double voltageThreshold = 0.038;
-
-            // One activation per upward threshold crossing (item 12) - a later crossing
-            // re-activates. No longer reset every 0.3 ms, and no longer tied to the
-            // presynaptic voltage falling back below threshold.
-            if ((presynVoltage >= voltageThreshold) && (presynVoltagePrev < voltageThreshold))
-            {
-                newVal.Item1.ActivationTime = GetSimulationTime();
-            }
-
-            double tCur = GetSimulationTime();
-            double tPrev = tCur - timeStep;
-            double ts = newVal.Item1.ActivationTime;
+            int level = currentTimeStep;
+            double tCur = level * timeStep;
+            double tPrev = (level - 1) * timeStep;
+            // Activation detected by the presynaptic cell up to this level (DetectSynapseActivations).
+            double ts = newVal.Item1.ActivationTimeAt(level);
 
             //Adds the synaptic currents for the current and previous timesteps
             Icurrs.Add(model.getModelCurrent(postsynVoltage, tCur, ts));
             Icurrs.Add(model.getModelCurrent(postsynVoltagePrev, tPrev, ts));
+
+            // Stability of the explicit synaptic term: cap the conductance by the membrane area
+            // of the postsynaptic node (paper Sec. 2.8).
+            double gMax = maxConductancePerArea32us * System.Math.Sqrt(32e-6 / timeStep) * areaMicrons2 * 1e-9;
+            double g = model.getConductance();
+            if (g > gMax)
+            {
+                Icurrs[0] *= gMax / g;
+                Icurrs[1] *= gMax / g;
+                if (cappedSynapses.Add(newVal.Item2))
+                {
+                    GameManager.instance.DebugLogSafe(model.getModelName() + " synapse at node " + k + ": conductance "
+                        + (g * 1e9).ToString("G3") + " nS exceeds the stability limit "
+                        + (gMax * 1e9).ToString("G3") + " nS for its membrane area (" + areaMicrons2.ToString("G3")
+                        + " um^2); capped to the limit.");
+                }
+            }
 
             // Only guard against a genuine computational error (NaN/Infinity), not a
             // legitimately large current (item 15).
@@ -491,7 +547,7 @@ namespace C2M2.NeuronalDynamics.Simulation
             /// IMEX-Euler start-up factorization I - timeStep*A for SolveStep's
             /// t==0 branch - see luStartup's doc comment.
             var startupStencils = makeSparseStencils(Neuron, res, cap, 1.5 * timeStep);
-            var startupLcsc = CompressedColumnStorage<double>.OfIndexed(startupStencils[1]);
+            startupLcsc = CompressedColumnStorage<double>.OfIndexed(startupStencils[1]);
             luStartup = SparseLU.Create(startupLcsc, ColumnOrdering.MinimumDegreeAtA, 0.1);
         }
 
@@ -502,6 +558,7 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// </summary>     
         protected override void SolveStep(int t)
         {
+            startupStepSolved = (t == 0);
             if (t == 0)
             {
                 // IMEX-Euler (SBDF1) start-up step - see luStartup's doc comment.
@@ -545,8 +602,11 @@ namespace C2M2.NeuronalDynamics.Simulation
             R = U_Active.Clone();
             explicitUpdate(R, Upre, reactF(reactConst, U_Active, N, M, H, cap), reactF(reactConst, Upre, Npre, Mpre, Hpre, cap), timeStep, 1);
 
+            // Rsyn = (2/3)*timeStep*surfaceArea.*(2*Isyn[0] - Isyn[1]). Spre must be a separate zero
+            // vector: passing Rsyn as both S and Spre made explicitUpdate read the half-updated S
+            // and give (8/9)Isyn[0] - (2/3)Isyn[1], a synaptic current 3x too weak.
             var Rsyn = Vector.Build.Dense(Neuron.nodes.Count, 0.0);
-            explicitUpdate(Rsyn, Rsyn, Isyn[0], Isyn[1], timeStep, surfaceArea);
+            explicitUpdate(Rsyn, Vector.Build.Dense(Neuron.nodes.Count, 0.0), Isyn[0], Isyn[1], timeStep, surfaceArea);
             // reset synaptic source this ensures that when you remove the synapse that Isyn becomes 0; 
             // therefore, current is not being sent to postsynapse once synapse is removed
             Isyn[0].Multiply(0.0, Isyn[0]);
@@ -648,8 +708,8 @@ namespace C2M2.NeuronalDynamics.Simulation
         /// This function initializes the voltage vector <c>U</c> and the state vectors
         /// <c>M</c>, <c>N</c>, and <c>H</c> \n
         /// The input <c>Neuron.vertCount</c> is the vertex count of the neuron geometry \n
-        /// <c>U</c> is initialized to 0 [V] for the entire cell \n
-        /// <c>M</c> is initialized to \f$m_i\f$ which is set by <c>mi</c> \n
+        /// <c>U</c> is initialized to VStart = -70 [mV] for the entire cell \n
+        /// <c>M</c> is initialized to \f$m_i\f$ which is set by <c>mi</c> (steady state at VStart) \n
         /// <c>N</c> is initialized to \f$n_i\f$ which is set by <c>ni</c> \n
         /// <c>H</c> is initialized to \f$h_i\f$ which is set by <c>hi</c>
         /// </summary>
@@ -691,7 +751,7 @@ namespace C2M2.NeuronalDynamics.Simulation
             Mpre = M.Clone(); Npre = N.Clone(); Hpre = H.Clone();
 
             // Set color bar range directly on ColorLUT to bypass serialized field defaults
-            ColorLUT.GlobalMin = -0.07f;   // -100 mV
+            ColorLUT.GlobalMin = -0.07f;   // -70 mV (VStart)
             ColorLUT.GlobalMax = 0.05f;   //   50 mV
         }
         /// <summary>

@@ -199,10 +199,66 @@ namespace C2M2.NeuronalDynamics.Simulation {
             }
         }
 
+        /// <summary>
+        /// Synaptic currents for the step from V^t to V^(t+1). They need V^t and V^(t-1) at the
+        /// postsynaptic nodes, which all lie on this cell, so they are read from this cell's own
+        /// solver state, and the activation times detected up to level t (paper Sec. 3.1.5).
+        /// Computed here, after the solve barrier, so that every crossing detected in the
+        /// previous step, on any cell, is visible.
+        /// </summary>
+        protected override void PreSolveStep(int t)
+        {
+            //Checks if there are currently any synapses by using the list kept in synapseManager
+            // Use a snapshot to avoid concurrent modification from main thread
+            List<(Synapse, Synapse)> synapseSnapshot = Manager.synapseManager.GetSynapsesSnapshot();
+            if (synapseSnapshot.Count > 0)
+            {
+                //Creates a list of (Synapse, Synapse) pairs to keep track of corresponding pre- and post-synapses
+                //Note: a Synapse refers to the prefab Synapse, a type of marker attached to a node when it is either the pre- or post- synaptic node
+                List<(Synapse, Synapse)> synapses = new List<(Synapse, Synapse)>(); //pre (Item1) and post (Item2) synapses
+
+                // Iterates through the snapshot of synapse pairs
+                // Checks if the neuron attached to this simulation class contains any post-synapse nodes
+                foreach ((Synapse, Synapse) syn in synapseSnapshot)
+                {
+                    Synapse preSynapse = syn.Item1;
+                    Synapse postSynapse = syn.Item2;
+
+                    if (this == postSynapse.simulation)
+                    {
+                        //After the foreach loop, the synapses list will contain a list of all the synapses with a post-synaptic side on the
+                        //current neuron, which this simulation is attached to
+                        synapses.Add((preSynapse, postSynapse));
+                    }
+                }
+
+                // Set the post synaptic current for each pair of pre/post synapses i.e. each tuple (Synapse,Synapse)
+                SetSynapseCurrent(synapses);
+            }
+        }
+
         protected override void PostSolveStep(int t)
         {
             ApplyInteractionVals();
+            DetectActivations();
             SetOutputValues();
+
+            // Threshold crossings at the presynaptic nodes on this cell, between V^t and the
+            // final V^(t+1) (after clamps and direct stimulation), on this cell's own thread.
+            void DetectActivations()
+            {
+                List<(Synapse, Synapse)> synapseSnapshot = Manager.synapseManager.GetSynapsesSnapshot();
+                if (synapseSnapshot.Count == 0) return;
+
+                // a presynapse shared by several pairs is checked once
+                HashSet<Synapse> preSynapses = new HashSet<Synapse>();
+                foreach ((Synapse, Synapse) syn in synapseSnapshot)
+                {
+                    if (syn.Item1 != null && this == syn.Item1.simulation) preSynapses.Add(syn.Item1);
+                }
+                if (preSynapses.Count > 0) DetectSynapseActivations(new List<Synapse>(preSynapses), t);
+            }
+
             void ApplyInteractionVals()
             {
                 /// Apply clamp values, if there are any clamps
@@ -222,34 +278,6 @@ namespace C2M2.NeuronalDynamics.Simulation {
                     }
                 }
 
-                //Checks if there are currently any synapses by using the list kept in synapseManager
-                // Use a snapshot to avoid concurrent modification from main thread
-                List<(Synapse, Synapse)> synapseSnapshot = Manager.synapseManager.GetSynapsesSnapshot();
-                if (synapseSnapshot.Count > 0)
-                {
-                    //Creates a list of (Synapse, Synapse) pairs to keep track of corresponding pre- and post-synapses
-                    //Note: a Synapse refers to the prefab Synapse, a type of marker attached to a node when it is either the pre- or post- synaptic node
-                    List<(Synapse, Synapse)> synapses = new List<(Synapse, Synapse)>(); //pre (Item1) and post (Item2) synapses
-
-                    // Iterates through the snapshot of synapse pairs
-                    // Checks if the neuron attached to this simulation class contains any post-synapse nodes
-                    foreach ((Synapse, Synapse) syn in synapseSnapshot)
-                    {
-                        Synapse preSynapse = syn.Item1;
-                        Synapse postSynapse = syn.Item2;
-
-                        if (this == postSynapse.simulation)
-                        {
-                            //After the foreach loop, the synapses list will contain a list of all the synapses with a post-synaptic side on the
-                            //current neuron, which this simulation is attached to
-                            synapses.Add((preSynapse, postSynapse));
-                        }
-                    }
-
-                    // Set the post synaptic current for each pair of pre/post synapses i.e. each tuple (Synapse,Synapse)
-                    SetSynapseCurrent(synapses);
-                }
-                
                 // Apply raycast values
                 if (raycastHits.Length > 0)
                 {
@@ -265,6 +293,13 @@ namespace C2M2.NeuronalDynamics.Simulation {
         /// </summary>
         /// <param name="synapses">pre (Item1) and post (Item2) synapses</param>
         internal abstract void SetSynapseCurrent(List<(Synapse, Synapse)> synapses);
+
+        /// <summary>
+        /// Records the activations of the presynapses on this cell whose voltage crossed the
+        /// spike-detection threshold in the step from V^t to V^(t+1). Called on this cell's solve thread.
+        /// </summary>
+        /// <param name="preSynapses">presynapses on this cell</param>
+        internal virtual void DetectSynapseActivations(List<Synapse> preSynapses, int t) { }
 
         protected override void OnAwakePost(Mesh viz)
         {

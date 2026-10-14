@@ -99,6 +99,11 @@ public class ModelAMPA : ISynapseModel
     {
         return taud;
     }
+
+    public double getConductance()
+    {
+        return g;
+    }
     
     public bool isActive(double presynVoltage, double presynVoltagePrev, double SimulationTime, double ActivationTime)
     {
